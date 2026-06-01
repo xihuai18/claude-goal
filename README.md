@@ -2,7 +2,7 @@
 
 A Codex-style `/goal` command for Claude Code, **safe across concurrent sessions**.
 
-It gives Claude Code a persistent local goal state, Codex-inspired continuation instructions, pause/resume/clear/status controls, completion-audit guardrails, and a Stop hook that keeps Claude working while a goal is active.
+Gives Claude Code a persistent local goal state, auto-continuation via Stop hook, pause/resume/clear/complete controls, and completion-verification guardrails.
 
 ## Why
 
@@ -12,8 +12,17 @@ Most goal-tracking tools key state by terminal id or working directory, which si
 
 ## Install
 
+**Via plugin marketplace (recommended):**
+
+```
+/plugin marketplace add xihuai18/claude-goal
+/plugin install goal
+```
+
+**Via git clone:**
+
 ```bash
-git clone https://github.com/<you>/claude-goal.git
+git clone https://github.com/xihuai18/claude-goal.git
 cd claude-goal
 ./install.sh
 ```
@@ -46,7 +55,9 @@ After install, **restart Claude Code** so the `SessionStart` hook fires for curr
 /goal complete
 ```
 
-When a goal is active, the command returns a continuation prompt that wraps the goal text in `<objective>` and requires a completion audit before marking the goal complete.
+When a goal is active, the Stop hook prevents Claude from stopping until you run `/goal pause`, `/goal clear`, or `/goal complete`.
+
+Before marking complete, Claude verifies against real evidence (files, tests, output). If verification fails, work continues automatically.
 
 ## Concurrent sessions
 
@@ -54,19 +65,27 @@ Open Claude Code in two tabs at the same time. Set `/goal A` in tab 1 and `/goal
 
 How it works:
 
-1. The `SessionStart` hook receives Claude's session id via stdin JSON and writes `~/.claude/goal/sessions/<claude_pid>.id`. The Claude PID is `os.getppid()` from inside the hook.
-2. When `claude_goal.py` is later invoked by a Bash subprocess, it walks its ancestor PIDs (`ps -o ppid=`) and reads the first marker it finds. That gives it the real Claude session id — `claude:<uuid>` — which is unique per conversation.
-3. The Stop hook also receives the session id directly via stdin and uses it as the primary candidate.
+1. The `SessionStart` hook receives Claude's session id via stdin JSON and writes `~/.claude/goal/sessions/<claude_pid>.id`.
+2. When `claude_goal.py` is later invoked by a Bash subprocess, it walks its ancestor PIDs and reads the first valid marker it finds. That gives it the real Claude session id — `claude:<uuid>` — which is unique per conversation.
+3. The Stop hook receives the session id directly via stdin and uses it as the primary candidate.
 4. Goals are stored in SQLite keyed by the resolved session id (`UNIQUE(session_id)`).
+5. `find_goal` respects priority order: if a higher-priority anchor matches (even with a non-active goal), it stops searching — never falls through to a lower-priority cwd hash that might belong to another session.
 
-Fallbacks (in order, if no marker is reachable): `CLAUDE_GOAL_SESSION_ID` env override, `TERM_SESSION_ID` / `ITERM_SESSION_ID`, `PWD` hash. Existing goals from the legacy cwd-keyed scheme are still resolvable during the migration window.
+Session end automatically pauses any active goal, preventing zombie goals from leaking across sessions.
 
-## Stale marker cleanup
+Fallbacks (in order, if no marker is reachable): `CLAUDE_GOAL_SESSION_ID` env override, `TERM_SESSION_ID` / `ITERM_SESSION_ID`, `PWD` hash.
 
-`SessionStart` cleans up marker files whose owning PIDs are no longer alive. Manual cleanup:
+## Safety features
+
+- **Fail-open hooks**: If the DB is corrupted or unreadable, the Stop hook allows Claude to stop naturally rather than crashing.
+- **Marker TTL**: Markers older than 7 days are ignored to mitigate PID reuse by the OS.
+- **Runaway guard**: Max 500 auto-continuations per goal (configurable via `CLAUDE_GOAL_MAX_STOP_CONTINUES`).
+- **Events cleanup**: Events older than 30 days are pruned on each SessionStart.
+
+## Test
 
 ```bash
-python3 ~/.claude/skills/goal/scripts/claude_goal.py cleanup-markers
+python3 -m pytest tests -v
 ```
 
 ## Notes
@@ -74,16 +93,3 @@ python3 ~/.claude/skills/goal/scripts/claude_goal.py cleanup-markers
 Claude Code custom skills do not currently expose reliable live per-turn token usage to markdown commands. Token budgets are therefore stored and displayed as soft budgets. Elapsed-time tracking is local and persistent.
 
 The Stop hook blocks Claude from stopping while the current goal is active. It stops blocking when you run `/goal pause`, `/goal clear`, or `/goal complete`.
-
-By default, the runaway guard allows up to 500 Stop-hook continuations for a single active goal. That high default is intentional: `/goal` is meant for long-running work where Claude may need many turns to finish. If you want a stricter cap, set `CLAUDE_GOAL_MAX_STOP_CONTINUES` before launching Claude Code:
-
-```bash
-export CLAUDE_GOAL_MAX_STOP_CONTINUES=50
-```
-
-## Test
-
-```bash
-python3 -m pytest tests
-```
-

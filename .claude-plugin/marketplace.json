@@ -1,21 +1,21 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "xihuai18-claude-goal",
-  "description": "Codex-style persistent /goal command for Claude Code with concurrent-session isolation",
   "owner": {
-    "name": "xihuai18",
-    "email": "xihuai18@gmail.com"
+    "name": "xihuai18"
+  },
+  "metadata": {
+    "description": "Codex-style persistent /goal command for Claude Code with concurrent-session isolation",
+    "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "goal",
       "description": "Persistent /goal command — set a long-running objective, auto-continue until done, pause/resume/clear/complete. Concurrent-session safe.",
+      "version": "1.0.0",
       "author": {
         "name": "xihuai18"
       },
-      "category": "productivity",
-      "source": "./plugins/goal",
-      "homepage": "https://github.com/xihuai18/claude-goal"
+      "source": "./plugins/goal"
     }
   ]
 }

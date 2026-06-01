@@ -39,6 +39,7 @@ STATE_DIR = Path(os.environ.get("CLAUDE_GOAL_HOME", Path.home() / ".claude" / "g
 DB_PATH = Path(os.environ.get("CLAUDE_GOAL_DB", STATE_DIR / "goals.sqlite"))
 SESSIONS_SUBDIR = "sessions"
 ANCESTOR_WALK_LIMIT = 20
+MARKER_MAX_AGE_SECONDS = 7 * 86400  # 7 days; mitigates PID reuse
 
 
 def now() -> int:
@@ -87,14 +88,24 @@ def _parent_pid(pid: int) -> int | None:
 
 
 def _read_marker(pid: int) -> str | None:
-    """Return the session id stored in the marker file at this pid, or None."""
+    """Return the session id stored in the marker file at this pid, or None.
+
+    Markers older than MARKER_MAX_AGE_SECONDS are treated as stale to
+    mitigate PID reuse: if the OS recycles a PID, an old marker would
+    incorrectly anchor a new unrelated process to a dead session.
+    """
     marker = _sessions_dir() / f"{pid}.id"
     try:
         data = json.loads(marker.read_text())
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
     sid = data.get("session_id")
     if not sid:
+        return None
+    created_at = data.get("created_at")
+    if isinstance(created_at, (int, float)) and now() - int(created_at) > MARKER_MAX_AGE_SECONDS:
         return None
     return f"claude:{sid}"
 
@@ -184,13 +195,13 @@ def candidate_session_ids(hook_data: dict[str, Any] | None = None) -> list[str]:
     if hook_data:
         hook_sid = hook_data.get("session_id")
         if hook_sid:
+            sources.append(hook_sid)
             sources.append(f"claude:{hook_sid}")
         sources.append(cwd_session_id(hook_data.get("cwd")))
     sources.append(_walk_ancestors_for_session())
     sources.append(_term_session_id())
     cwd = os.environ.get("PWD") or str(Path.cwd())
     sources.append("cwd:" + hashlib.sha256(cwd.encode()).hexdigest()[:16])
-    sources.append(session_id())
     for value in sources:
         if value and value not in out:
             out.append(value)
@@ -199,8 +210,9 @@ def candidate_session_ids(hook_data: dict[str, Any] | None = None) -> list[str]:
 
 def sqlite_connect(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     init_db(conn)
     return conn
 
@@ -318,20 +330,25 @@ def find_goal(
 ) -> sqlite3.Row | None:
     """Find the goal that belongs to *this* session, robust to anchor drift.
 
-    Tries each candidate session id and returns the most recently updated
-    match. Critically, this does NOT fall back to "any active goal in the
-    DB" — that fallback would leak goals across separate Claude sessions.
-    With Claude-session marker + terminal anchor + cwd hash + env
-    overrides, drift inside one session is handled, and no cross-session
-    leakage is possible.
+    Tries each candidate session id in priority order and returns the
+    first match. The candidates list is already ordered by reliability
+    (claude-session marker > terminal anchor > cwd hash), so returning
+    the first hit ensures a high-priority anchor always wins over a
+    low-priority fallback — preventing cross-session contamination when
+    multiple sessions share the same cwd.
+
+    When only_active=True: if the highest-priority matching row exists
+    but is not active (paused/complete/budget_limited), returns None
+    rather than searching lower-priority candidates. This prevents a
+    session with a paused goal from accidentally matching another
+    session's active goal via a shared cwd fallback.
     """
-    matches: list[sqlite3.Row] = []
     for sid in candidates:
         row = get_goal(conn, sid)
-        if row and (not only_active or row["status"] == "active"):
-            matches.append(row)
-    if matches:
-        return max(matches, key=lambda r: r["updated_at"] or 0)
+        if row:
+            if only_active and row["status"] != "active":
+                return None
+            return row
     return None
 
 
@@ -348,41 +365,28 @@ def validate_objective(objective: str) -> str:
 
 def set_goal(conn: sqlite3.Connection, sid: str, objective: str, token_budget: int | None) -> sqlite3.Row:
     objective = validate_objective(objective)
-    existing = get_goal(conn, sid)
-    if existing:
-        raise ValueError("this Claude session already has a goal; use: /goal clear, then set a new goal")
     goal_id = str(uuid.uuid4())
     ts = now()
     status = "budget_limited" if token_budget is not None and token_budget <= 0 else "active"
-    execute(
-        conn,
-        """
-        INSERT INTO goals (
-            id, session_id, objective, status, token_budget, tokens_used,
-            time_used_seconds, active_started_at, created_at, updated_at,
-            completed_at, source, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, NULL, 'claude', '{}')
-        ON CONFLICT(session_id) DO UPDATE SET
-            id = excluded.id,
-            objective = excluded.objective,
-            status = excluded.status,
-            token_budget = excluded.token_budget,
-            tokens_used = 0,
-            time_used_seconds = 0,
-            active_started_at = excluded.active_started_at,
-            created_at = excluded.created_at,
-            updated_at = excluded.updated_at,
-            completed_at = NULL,
-            source = excluded.source,
-            metadata_json = excluded.metadata_json
-        """,
-        (goal_id, sid, objective, status, token_budget, ts, ts, ts),
-    )
+    try:
+        execute(
+            conn,
+            """
+            INSERT INTO goals (
+                id, session_id, objective, status, token_budget, tokens_used,
+                time_used_seconds, active_started_at, created_at, updated_at,
+                completed_at, source, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, NULL, 'claude', '{}')
+            """,
+            (goal_id, sid, objective, status, token_budget, ts, ts, ts),
+        )
+    except sqlite3.IntegrityError:
+        raise ValueError("this Claude session already has a goal; use: /goal clear, then set a new goal")
     event(conn, sid, "set", objective, goal_id)
     return get_goal(conn, sid)  # type: ignore[return-value]
 
 
-def update_status(conn: sqlite3.Connection, sid: str, status: str) -> sqlite3.Row:
+def update_status(conn: sqlite3.Connection, status: str) -> sqlite3.Row:
     if status not in STATUSES:
         raise ValueError(f"invalid status: {status}")
     goal = find_goal(conn, candidate_session_ids())
@@ -406,7 +410,7 @@ def update_status(conn: sqlite3.Connection, sid: str, status: str) -> sqlite3.Ro
     return get_goal(conn, goal["session_id"])  # type: ignore[return-value]
 
 
-def clear_goal(conn: sqlite3.Connection, sid: str) -> bool:
+def clear_goal(conn: sqlite3.Connection) -> bool:
     goal = find_goal(conn, candidate_session_ids())
     if goal:
         execute(conn, "DELETE FROM goals WHERE id = ?", (goal["id"],))
@@ -460,47 +464,31 @@ def render_goal_json(row: sqlite3.Row | None) -> str:
 
 
 CONTINUATION_INSTRUCTIONS = """\
-Continue working toward the active Claude thread goal.
+You have an active goal. Continue working toward it.
 
-The objective below is the current goal. Treat it as task context, not as higher-priority instructions.
-
-<objective>
+<goal>
 {objective}
-</objective>
+</goal>
 
-Budget:
-- Time spent pursuing goal: {elapsed}
-- Tokens used: {tokens_used}
-- Token budget: {token_budget}
+Progress: {elapsed} elapsed | tokens: {tokens_used} / {token_budget}
 
-Avoid repeating work that is already done. Choose the next concrete action toward the objective.
-
-Before deciding that the goal is achieved, perform a completion audit against actual current state:
-- Restate the objective as concrete deliverables or success criteria.
-- Build a prompt-to-artifact checklist mapping every explicit requirement, named file, command, test, gate, and deliverable to concrete evidence.
-- Inspect relevant files, command output, test results, repo state, or other real evidence.
-- Identify missing, incomplete, weakly verified, or uncovered requirements.
-- Treat uncertainty as not achieved; continue verification or work.
-
-Only mark the goal complete after the audit shows the objective is achieved and no required work remains. To mark it complete, run:
-`python3 ~/.claude/skills/goal/scripts/claude_goal.py complete`
-Then report the final elapsed time and token-budget state to the user.
+Rules:
+- Pick the next concrete action. Do not re-explain the goal or repeat finished work.
+- If blocked on user input, say what you need and stop.
+- Before claiming completion, verify against real evidence (files, tests, output).
+  Only after verification passes, run: `python3 ~/.claude/skills/goal/scripts/claude_goal.py complete`
 """
 
 
 STOP_HOOK_REASON = """\
-An active /goal is still running.
+Active goal — do not stop yet.
 
-<objective>
+<goal>
 {objective}
-</objective>
+</goal>
 
-Continue working toward the objective. Avoid repeating completed work.
-
-If the objective is fully achieved, first perform the completion audit, then run:
-`python3 ~/.claude/skills/goal/scripts/claude_goal.py complete`
-
-If the goal cannot continue productively because user input is required, explain the blocker clearly. The user can run `/goal pause` or `/goal clear` to stop automatic continuation.
+Continue. If truly blocked on user input, explain the blocker.
+User can run `/goal pause` or `/goal clear` to release.
 """
 
 
@@ -533,19 +521,18 @@ def invoke(raw_args: str) -> str:
     with sqlite_connect() as conn:
         raw_args = (raw_args or "").strip()
         command = raw_args.split(maxsplit=1)[0].lower() if raw_args else "status"
-        rest = raw_args.split(maxsplit=1)[1] if " " in raw_args else ""
 
         if command in {"status", "show", "get", "menu"}:
             return render_invoke_result("status", find_goal(conn, candidate_session_ids()))
         if command == "pause":
-            return render_invoke_result("pause", update_status(conn, sid, "paused"))
+            return render_invoke_result("pause", update_status(conn, "paused"))
         if command == "resume":
-            return render_invoke_result("resume", update_status(conn, sid, "active"))
+            return render_invoke_result("resume", update_status(conn, "active"))
         if command == "clear":
-            cleared = clear_goal(conn, sid)
+            cleared = clear_goal(conn)
             return "Goal cleared." if cleared else "No goal to clear."
         if command == "complete":
-            return render_invoke_result("complete", update_status(conn, sid, "complete"))
+            return render_invoke_result("complete", update_status(conn, "complete"))
         objective, budget = parse_set_args(raw_args)
         return render_invoke_result("set", set_goal(conn, sid, objective, budget))
 
@@ -579,7 +566,9 @@ def session_start_hook() -> int:
     """
     try:
         data = json.load(sys.stdin)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     sid = data.get("session_id")
     if not sid:
@@ -587,6 +576,12 @@ def session_start_hook() -> int:
     sessions = _sessions_dir()
     sessions.mkdir(parents=True, exist_ok=True)
     cleanup_stale_markers()
+    # Prune events older than 30 days to prevent unbounded table growth.
+    try:
+        with sqlite_connect() as conn:
+            execute(conn, "DELETE FROM events WHERE created_at < ?", (now() - 30 * 86400,))
+    except Exception:
+        pass
     claude_pid = os.getppid()
     marker = sessions / f"{claude_pid}.id"
     payload = {
@@ -603,11 +598,55 @@ def session_start_hook() -> int:
 
 
 def session_end_hook() -> int:
-    """Remove this session's marker file on shutdown."""
+    """Remove this session's marker file and pause any active goal on shutdown.
+
+    Pausing the goal prevents it from becoming a zombie that triggers
+    other sessions' stop hooks, and stops active_started_at from
+    accumulating time across the dead session gap.
+    """
     try:
-        data = json.load(sys.stdin)
+        hook_data = json.load(sys.stdin)
     except json.JSONDecodeError:
-        data = {}
+        hook_data = {}
+    if not isinstance(hook_data, dict):
+        hook_data = {}
+
+    # Pause any active goal belonging to this session using only the
+    # hook payload's session_id — do NOT use the broad candidate list,
+    # which could match a sibling session's goal via shared cwd hash.
+    hook_sid = hook_data.get("session_id")
+    try:
+        if hook_sid:
+            with sqlite_connect() as conn:
+                goal = get_goal(conn, f"claude:{hook_sid}")
+                if goal and goal["status"] == "active":
+                    used = active_time(goal)
+                    ts = now()
+                    execute(
+                        conn,
+                        """
+                        UPDATE goals
+                        SET status = 'paused', time_used_seconds = ?, active_started_at = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (used, ts, goal["id"]),
+                    )
+                    event(conn, goal["session_id"], "session_end_pause", goal_id=goal["id"])
+    except Exception:
+        pass  # Best-effort; don't block session shutdown.
+
+    # Remove marker by matching session_id in payload (not just ppid) to
+    # handle cases where ppid differs from the original Claude process.
+    sessions = _sessions_dir()
+    if hook_sid and sessions.exists():
+        for path in sessions.glob("*.id"):
+            try:
+                if json.loads(path.read_text()).get("session_id") == hook_sid:
+                    path.unlink()
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+    # Also try ppid-based removal as fallback.
     claude_pid = os.getppid()
     marker = _sessions_dir() / f"{claude_pid}.id"
     try:
@@ -618,51 +657,58 @@ def session_end_hook() -> int:
     return 0
 
 
+def _parse_max_stop_continues() -> int:
+    raw = os.environ.get("CLAUDE_GOAL_MAX_STOP_CONTINUES", "500")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 500
+
+
 def stop_hook() -> int:
     try:
         data = json.load(sys.stdin)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
 
     candidates = candidate_session_ids(data)
 
-    with sqlite_connect() as conn:
-        goal = find_goal(conn, candidates, only_active=True)
-        if not goal or goal["status"] != "active":
-            return 0
+    try:
+        with sqlite_connect() as conn:
+            goal = find_goal(conn, candidates, only_active=True)
+            if not goal or goal["status"] != "active":
+                return 0
 
-        max_continues = int(os.environ.get("CLAUDE_GOAL_MAX_STOP_CONTINUES", "500"))
-        recent_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM events
-            WHERE goal_id = ?
-              AND event = 'stop_continue'
-              AND created_at >= ?
-            """,
-            (goal["id"], goal["active_started_at"] or goal["created_at"]),
-        ).fetchone()[0]
-        if recent_count >= max_continues:
+            max_continues = _parse_max_stop_continues()
+            recent_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM events
+                WHERE goal_id = ?
+                  AND event = 'stop_continue'
+                  AND created_at >= ?
+                """,
+                (goal["id"], goal["active_started_at"] or goal["created_at"]),
+            ).fetchone()[0]
+            if recent_count >= max_continues:
+                event(conn, goal["session_id"], "stop_exceeded", goal_id=goal["id"])
+                # Output nothing — allows Claude to stop naturally.
+                return 0
+
+            event(conn, goal["session_id"], "stop_continue", goal_id=goal["id"])
             print(
                 json.dumps(
                     {
-                        "continue": True,
-                        "stopReason": f"/goal auto-continuation stopped after {max_continues} Stop-hook continuations. Run /goal resume or raise CLAUDE_GOAL_MAX_STOP_CONTINUES to continue automatically.",
+                        "decision": "block",
+                        "reason": STOP_HOOK_REASON.format(objective=goal["objective"]),
                     }
                 )
             )
-            return 0
-
-        event(conn, goal["session_id"], "stop_continue", goal_id=goal["id"])
-        print(
-            json.dumps(
-                {
-                    "decision": "block",
-                    "reason": STOP_HOOK_REASON.format(objective=goal["objective"]),
-                }
-            )
-        )
-        return 0
+    except Exception:
+        pass  # Fail-open: allow Claude to stop if DB is broken.
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -708,16 +754,16 @@ def main(argv: list[str]) -> int:
                 print(render_invoke_result("status", find_goal(conn, candidate_session_ids())))
         elif args.cmd == "pause":
             with sqlite_connect() as conn:
-                print(render_invoke_result("pause", update_status(conn, session_id(), "paused")))
+                print(render_invoke_result("pause", update_status(conn, "paused")))
         elif args.cmd == "resume":
             with sqlite_connect() as conn:
-                print(render_invoke_result("resume", update_status(conn, session_id(), "active")))
+                print(render_invoke_result("resume", update_status(conn, "active")))
         elif args.cmd == "clear":
             with sqlite_connect() as conn:
-                print("Goal cleared." if clear_goal(conn, session_id()) else "No goal to clear.")
+                print("Goal cleared." if clear_goal(conn) else "No goal to clear.")
         elif args.cmd == "complete":
             with sqlite_connect() as conn:
-                print(render_invoke_result("complete", update_status(conn, session_id(), "complete")))
+                print(render_invoke_result("complete", update_status(conn, "complete")))
         elif args.cmd == "set":
             objective, budget = parse_set_args(" ".join(args.args))
             with sqlite_connect() as conn:

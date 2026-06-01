@@ -1,0 +1,14 @@
+{
+  "name": "claude-goal",
+  "description": "Codex-style persistent /goal command for Claude Code with concurrent-session isolation",
+  "owner": {
+    "name": "leoxihwang",
+    "url": "https://github.com/leoxihwang"
+  },
+  "plugins": [
+    {
+      "name": "goal",
+      "path": "."
+    }
+  ]
+}

@@ -47,7 +47,7 @@ def test_set_status_pause_resume_complete(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "Action: set" in result.stdout
     assert "Token budget: 98.5K" in result.stdout
-    assert "<objective>" in result.stdout
+    assert "<goal>" in result.stdout
 
     result = run_goal(tmp_path, "pause")
     assert result.returncode == 0, result.stderr
@@ -102,7 +102,7 @@ def test_stop_hook_blocks_active_goal(tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
     assert data["decision"] == "block"
-    assert "<objective>" in data["reason"]
+    assert "<goal>" in data["reason"]
 
 
 def test_stop_hook_allows_paused_goal(tmp_path):
@@ -479,3 +479,159 @@ def test_walk_ancestors_handles_dead_chain(monkeypatch, tmp_path):
     cg = _load_module(monkeypatch, tmp_path)
     # No markers written
     assert cg._walk_ancestors_for_session() is None
+
+
+# -------- find_goal priority ordering --------
+
+
+def test_find_goal_prefers_higher_priority_candidate(tmp_path):
+    """find_goal returns the first match in candidate order, not max(updated_at)."""
+    state_dir = tmp_path / "goal-home"
+
+    # Set a goal under cwd hash (lower priority)
+    cwd_sid = "cwd:" + hashlib.sha256(b"/Users/me/proj").hexdigest()[:16]
+    env_base = os.environ.copy()
+    env_base["CLAUDE_GOAL_HOME"] = str(state_dir)
+    env_base["CLAUDE_GOAL_DB"] = str(state_dir / "goals.sqlite")
+
+    env_cwd = dict(env_base)
+    env_cwd["CLAUDE_GOAL_SESSION_ID"] = cwd_sid
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "legacy cwd goal"],
+        env=env_cwd, text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    # Set a goal under claude:session (higher priority)
+    env_claude = dict(env_base)
+    env_claude["CLAUDE_GOAL_SESSION_ID"] = "claude:primary-session"
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "real session goal"],
+        env=env_claude, text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    # Now query with candidate list [claude:primary-session, cwd:<hash>]
+    # Should find the claude: goal even if cwd goal has a newer updated_at.
+    import time
+    time.sleep(0.1)
+    # Touch the cwd goal to make its updated_at newer
+    subprocess.run(
+        [sys.executable, str(SCRIPT), "pause"],
+        env=env_cwd, text=True, capture_output=True, check=False,
+    )
+    subprocess.run(
+        [sys.executable, str(SCRIPT), "resume"],
+        env=env_cwd, text=True, capture_output=True, check=False,
+    )
+
+    # Status from the claude: session should still show its own goal
+    status = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env_claude, text=True, capture_output=True, check=False,
+    )
+    assert "real session goal" in status.stdout
+    assert "legacy cwd goal" not in status.stdout
+
+
+# -------- session_end_hook pauses active goal --------
+
+
+def test_session_end_hook_pauses_active_goal(tmp_path):
+    """When a session ends, its active goal is paused to prevent zombie."""
+    state_dir = tmp_path / "goal-home"
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_HOME"] = str(state_dir)
+    env["CLAUDE_GOAL_DB"] = str(state_dir / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "claude:ending-session"
+
+    # Set and verify active
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "will be paused on end"],
+        env=env, text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    # Fire session-end-hook
+    end_result = subprocess.run(
+        [sys.executable, str(SCRIPT), "session-end-hook"],
+        input=json.dumps({"session_id": "ending-session", "cwd": "/somewhere"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert end_result.returncode == 0, end_result.stderr
+
+    # Verify the goal is now paused
+    status = subprocess.run(
+        [sys.executable, str(SCRIPT), "status"],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert "Status: paused" in status.stdout
+    assert "will be paused on end" in status.stdout
+
+
+def test_session_end_zombie_doesnt_block_other_sessions(tmp_path):
+    """A goal paused by session end does NOT trigger stop hook for another session."""
+    state_dir = tmp_path / "goal-home"
+    env_a = os.environ.copy()
+    env_a["CLAUDE_GOAL_HOME"] = str(state_dir)
+    env_a["CLAUDE_GOAL_DB"] = str(state_dir / "goals.sqlite")
+    env_a["CLAUDE_GOAL_SESSION_ID"] = "claude:session-a"
+    env_a["PWD"] = "/Users/me/shared-project"
+
+    # Session A sets a goal and then ends
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "session a work"],
+        env=env_a, text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    subprocess.run(
+        [sys.executable, str(SCRIPT), "session-end-hook"],
+        input=json.dumps({"session_id": "session-a", "cwd": "/Users/me/shared-project"}),
+        env=env_a, text=True, capture_output=True, check=False,
+    )
+
+    # Session B in the same directory — stop hook should NOT block
+    env_b = dict(env_a)
+    env_b["CLAUDE_GOAL_SESSION_ID"] = "claude:session-b"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "session-b", "cwd": "/Users/me/shared-project"}),
+        env=env_b, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""  # No blocking
+
+
+# -------- stop hook max continues --------
+
+
+def test_stop_hook_allows_stop_after_max_continues(tmp_path):
+    """After max continues exceeded, stop hook outputs nothing (allows stop)."""
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_HOME"] = str(tmp_path / "goal-home")
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goal-home" / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "test-session"
+    env["CLAUDE_GOAL_MAX_STOP_CONTINUES"] = "2"
+
+    # Set a goal
+    assert subprocess.run(
+        [sys.executable, str(SCRIPT), "set", "limited goal"],
+        env=env, text=True, capture_output=True, check=False,
+    ).returncode == 0
+
+    # First 2 stop hooks should block
+    for i in range(2):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "stop-hook"],
+            input=json.dumps({"session_id": "test-session"}),
+            env=env, text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["decision"] == "block", f"Iteration {i} should block"
+
+    # 3rd stop hook should allow (no output)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "test-session"}),
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""  # No blocking, no JSON output

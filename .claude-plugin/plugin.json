@@ -1,0 +1,16 @@
+{
+  "name": "goal",
+  "description": "Persistent /goal command — set a long-running objective, auto-continue until done, pause/resume/clear/complete. Concurrent-session safe.",
+  "version": "1.0.0",
+  "skills": [
+    {
+      "name": "goal",
+      "path": "goal"
+    }
+  ],
+  "hooks": {
+    "Stop": "python3 goal/scripts/claude_goal.py stop-hook",
+    "SessionStart": "python3 goal/scripts/claude_goal.py session-start-hook",
+    "SessionEnd": "python3 goal/scripts/claude_goal.py session-end-hook"
+  }
+}

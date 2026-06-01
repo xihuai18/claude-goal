@@ -1,0 +1,8 @@
+{
+  "name": "goal",
+  "version": "1.0.0",
+  "description": "Persistent /goal command — set a long-running objective, auto-continue until done, pause/resume/clear/complete. Concurrent-session safe.",
+  "author": {
+    "name": "xihuai18"
+  }
+}

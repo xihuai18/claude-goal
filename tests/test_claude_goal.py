@@ -105,6 +105,45 @@ def test_stop_hook_blocks_active_goal(tmp_path):
     assert "<goal>" in data["reason"]
 
 
+def test_active_goal_instructions_use_plugin_root_complete_command(tmp_path):
+    plugin_root = tmp_path / "plugin-root"
+    result = run_goal(
+        tmp_path,
+        "invoke",
+        "keep going",
+        env_extra={"CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+    )
+    assert result.returncode == 0, result.stderr
+    expected = f"{sys.executable} {plugin_root / 'scripts' / 'claude_goal.py'} complete"
+    assert expected in result.stdout
+    assert "~/.claude/skills/goal" not in result.stdout
+
+
+def test_stop_hook_reason_uses_plugin_root_complete_command(tmp_path):
+    plugin_root = tmp_path / "plugin-root"
+    env_extra = {"CLAUDE_PLUGIN_ROOT": str(plugin_root)}
+    assert run_goal(tmp_path, "set", "keep going", env_extra=env_extra).returncode == 0
+
+    env = os.environ.copy()
+    env["CLAUDE_GOAL_HOME"] = str(tmp_path / "goal-home")
+    env["CLAUDE_GOAL_DB"] = str(tmp_path / "goal-home" / "goals.sqlite")
+    env["CLAUDE_GOAL_SESSION_ID"] = "test-session"
+    env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "stop-hook"],
+        input=json.dumps({"session_id": "test-session", "stop_hook_active": False}),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    expected = f"{sys.executable} {plugin_root / 'scripts' / 'claude_goal.py'} complete"
+    assert expected in data["reason"]
+    assert "~/.claude/skills/goal" not in data["reason"]
+
+
 def test_stop_hook_allows_paused_goal(tmp_path):
     assert run_goal(tmp_path, "set", "keep going").returncode == 0
     assert run_goal(tmp_path, "pause").returncode == 0

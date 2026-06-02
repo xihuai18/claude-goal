@@ -463,6 +463,12 @@ def render_goal_json(row: sqlite3.Row | None) -> str:
     return json.dumps(row_to_dict(row), indent=2, sort_keys=True)
 
 
+def render_helper_command(command: str) -> str:
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    script_path = Path(plugin_root) / "scripts" / "claude_goal.py" if plugin_root else Path(__file__).resolve()
+    return " ".join(shlex.quote(part) for part in (sys.executable, str(script_path), command))
+
+
 CONTINUATION_INSTRUCTIONS = """\
 You have an active goal. Continue working toward it.
 
@@ -476,7 +482,7 @@ Rules:
 - Pick the next concrete action. Do not re-explain the goal or repeat finished work.
 - If blocked on user input, say what you need and stop.
 - Before claiming completion, verify against real evidence (files, tests, output).
-  Only after verification passes, run: `python3 ~/.claude/skills/goal/scripts/claude_goal.py complete`
+  Only after verification passes, run: `{complete_command}`
 """
 
 
@@ -488,6 +494,7 @@ Active goal — do not stop yet.
 </goal>
 
 Continue. If truly blocked on user input, explain the blocker.
+If the goal is complete, verify against real evidence, then run: `{complete_command}`
 User can run `/goal pause` or `/goal clear` to release.
 """
 
@@ -506,6 +513,7 @@ def render_invoke_result(action: str, goal: sqlite3.Row | None, extra: str = "")
                     elapsed=fmt_elapsed(active_time(goal)),
                     tokens_used=fmt_tokens(goal["tokens_used"]),
                     token_budget=fmt_tokens(goal["token_budget"]),
+                    complete_command=render_helper_command("complete"),
                 ),
             ]
         )
@@ -702,7 +710,10 @@ def stop_hook() -> int:
                 json.dumps(
                     {
                         "decision": "block",
-                        "reason": STOP_HOOK_REASON.format(objective=goal["objective"]),
+                        "reason": STOP_HOOK_REASON.format(
+                            objective=goal["objective"],
+                            complete_command=render_helper_command("complete"),
+                        ),
                     }
                 )
             )
